@@ -459,37 +459,41 @@ func TestParOrMultiwayBitmapOrExecutionLaneContract(t *testing.T) {
 	for i, input := range inputs {
 		inputSnapshots[i] = input.Clone()
 	}
-	for _, test := range []struct {
-		parallelism int
-		want        int
-	}{
-		{parallelism: 1, want: 1},
-		{parallelism: 2, want: 2},
-		{parallelism: 3, want: 3},
-		{parallelism: 4, want: 4},
-		{parallelism: 0, want: 4},
-		{parallelism: bitmapContainerSize, want: 4},
-	} {
-		got := ParOr(test.parallelism, inputs...)
-		if !got.Equals(expected) {
-			t.Fatalf("ParOr(%d) result differs from expected bitmap", test.parallelism)
-		}
-		if got.GetCardinality() != expected.GetCardinality() {
-			t.Fatalf("ParOr(%d) cardinality %d, want %d", test.parallelism, got.GetCardinality(), expected.GetCardinality())
-		}
-		if err := got.Validate(); err != nil {
-			t.Fatalf("validate ParOr(%d) result: %v", test.parallelism, err)
-		}
+	for _, availableProcs := range []int{1, 2, multiwayBitmapOrMaxWorkers} {
+		runtime.GOMAXPROCS(availableProcs)
+		for _, parallelism := range []int{1, 2, 3, 4, 0, bitmapContainerSize} {
+			want := parallelism
+			if want == 0 {
+				want = defaultWorkerCount
+			}
+			if want > multiwayBitmapOrMaxWorkers {
+				want = multiwayBitmapOrMaxWorkers
+			}
+			if want > availableProcs {
+				want = availableProcs
+			}
 
-		observer := newMultiwayBitmapOrTestLaneObserver(test.want)
-		observed, accepted := multiwayBitmapOrWithObserver(test.parallelism, inputs, observer)
-		if !accepted {
-			t.Fatalf("ParOr(%d) did not take the accepted reducer", test.parallelism)
+			got := ParOr(parallelism, inputs...)
+			if !got.Equals(expected) {
+				t.Fatalf("ParOr(%d) at GOMAXPROCS=%d result differs from expected bitmap", parallelism, availableProcs)
+			}
+			if got.GetCardinality() != expected.GetCardinality() {
+				t.Fatalf("ParOr(%d) at GOMAXPROCS=%d cardinality %d, want %d", parallelism, availableProcs, got.GetCardinality(), expected.GetCardinality())
+			}
+			if err := got.Validate(); err != nil {
+				t.Fatalf("validate ParOr(%d) at GOMAXPROCS=%d result: %v", parallelism, availableProcs, err)
+			}
+
+			observer := newMultiwayBitmapOrTestLaneObserver(want)
+			observed, accepted := multiwayBitmapOrWithObserver(parallelism, inputs, observer)
+			if !accepted {
+				t.Fatalf("ParOr(%d) at GOMAXPROCS=%d did not take the accepted reducer", parallelism, availableProcs)
+			}
+			if !observed.Equals(expected) {
+				t.Fatalf("observed ParOr(%d) at GOMAXPROCS=%d result differs from expected bitmap", parallelism, availableProcs)
+			}
+			observer.assertComplete(t)
 		}
-		if !observed.Equals(expected) {
-			t.Fatalf("observed ParOr(%d) result differs from expected bitmap", test.parallelism)
-		}
-		observer.assertComplete(t)
 	}
 	for i, input := range inputs {
 		if !input.Equals(inputSnapshots[i]) {

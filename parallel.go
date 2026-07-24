@@ -578,8 +578,8 @@ func ParAnd(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 // where the parameter "parallelism" caps how many workers are used
 // (if it is set to 0, a default number of workers is chosen). For the exact
 // 512-input one-key bitmap specialization, parallelism is a caller-inclusive
-// execution-lane count capped at four: the caller owns lane zero and the
-// remaining lanes run in launched stripe workers.
+// execution-lane count of min(request or default, four, available Ps): the
+// caller owns lane zero and the remaining lanes run in launched stripe workers.
 func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	var lKey uint16 = MaxUint16
 	var hKey uint16
