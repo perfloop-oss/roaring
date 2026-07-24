@@ -111,6 +111,40 @@ func sparseBitmapBackedSerializedInput(t *testing.T, key uint16) []byte {
 	return serialized
 }
 
+// duplicateKeyBitmapSerializedInput returns two bitmap containers with the
+// same key and disjoint word planes through the portable serialized format.
+func duplicateKeyBitmapSerializedInput(t *testing.T, key uint16) []byte {
+	t.Helper()
+
+	source := NewBitmap()
+	for low := uint32(0); low < 1<<16; low += 2 {
+		source.Add(uint32(key)<<16 | low)
+	}
+	for low := uint32(1); low < 1<<16; low += 2 {
+		source.Add(uint32(key+1)<<16 | low)
+	}
+	if source.highlowcontainer.size() != 2 {
+		t.Fatalf("source has %d containers, want 2", source.highlowcontainer.size())
+	}
+	for i, container := range source.highlowcontainer.containers {
+		if _, ok := container.(*bitmapContainer); !ok {
+			t.Fatalf("source container %d is %T, want *bitmapContainer", i, container)
+		}
+	}
+	serialized, err := source.ToBytes()
+	if err != nil {
+		t.Fatalf("serialize source: %v", err)
+	}
+
+	const headerSize = 24 // no-run header, two key/card pairs, and two offsets
+	if len(serialized) != headerSize+2*bitmapContainerSize*8 {
+		t.Fatalf("serialized bitmap is %d bytes, want %d", len(serialized), headerSize+2*bitmapContainerSize*8)
+	}
+	// The second key is the third uint16 in the descriptive header.
+	binary.LittleEndian.PutUint16(serialized[12:14], key)
+	return serialized
+}
+
 func loadSerializedOneKeyBitmaps(t *testing.T, serialized [][]byte, count int) []*Bitmap {
 	t.Helper()
 
@@ -186,6 +220,55 @@ func TestParOrMultiwayBitmapOrFromBuffer(t *testing.T) {
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("validate mutated ParOr result: %v", err)
+	}
+}
+
+func TestParOrMultiwayBitmapOrDuplicateImportedKeyFallsBack(t *testing.T) {
+	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
+		t.Fatalf("test uses %d inputs, fast path starts at %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
+	}
+
+	const key = uint16(12)
+	serialized := duplicateKeyBitmapSerializedInput(t, key)
+	loadInputs := func() []*Bitmap {
+		inputs := make([]*Bitmap, multiwayBitmapOrTestInputCount)
+		for i := range inputs {
+			inputs[i] = NewBitmap()
+			if _, err := inputs[i].FromBuffer(append([]byte(nil), serialized...)); err != nil {
+				t.Fatalf("deserialize bitmap %d: %v", i, err)
+			}
+			if inputs[i].highlowcontainer.size() != 2 {
+				t.Fatalf("bitmap %d has %d containers, want 2", i, inputs[i].highlowcontainer.size())
+			}
+			for containerIndex, container := range inputs[i].highlowcontainer.containers {
+				if _, ok := container.(*bitmapContainer); !ok {
+					t.Fatalf("bitmap %d container %d is %T, want *bitmapContainer", i, containerIndex, container)
+				}
+			}
+			if inputs[i].highlowcontainer.keys[0] != key || inputs[i].highlowcontainer.keys[1] != key {
+				t.Fatalf("bitmap %d keys are %v, want duplicate key %d", i, inputs[i].highlowcontainer.keys, key)
+			}
+		}
+		return inputs
+	}
+
+	parallelInputs := loadInputs()
+	inputSnapshots := make([]*Bitmap, len(parallelInputs))
+	for i, input := range parallelInputs {
+		inputSnapshots[i] = input.Clone()
+	}
+	want := FastOr(loadInputs()...)
+	got := ParOr(4, parallelInputs...)
+	if !got.Equals(want) {
+		t.Fatal("ParOr result differs from FastOr")
+	}
+	if got.GetCardinality() != want.GetCardinality() {
+		t.Fatalf("ParOr cardinality %d, want %d", got.GetCardinality(), want.GetCardinality())
+	}
+	for i, input := range parallelInputs {
+		if !input.Equals(inputSnapshots[i]) {
+			t.Fatalf("ParOr modified imported input %d", i)
+		}
 	}
 }
 

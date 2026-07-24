@@ -265,6 +265,9 @@ func multiwayBitmapOr(parallelism int, bitmaps []*Bitmap) (*Bitmap, bool) {
 
 	key := bitmaps[0].highlowcontainer.keys[0]
 	for _, bitmap := range bitmaps {
+		if bitmap.highlowcontainer.size() != 1 {
+			return nil, false
+		}
 		if _, ok := bitmap.highlowcontainer.containers[0].(*bitmapContainer); !ok {
 			return nil, false
 		}
