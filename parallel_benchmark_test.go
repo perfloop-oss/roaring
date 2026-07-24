@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"math/rand"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 )
 
 func BenchmarkIntersectionLargeParallel(b *testing.B) {
@@ -386,7 +388,64 @@ func newMultiwayBitmapOrContractInputs(t *testing.T) ([]*Bitmap, *Bitmap) {
 	return inputs, expected
 }
 
-func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
+type multiwayBitmapOrTestLaneObserver struct {
+	mu       sync.Mutex
+	started  []time.Time
+	finished []time.Time
+}
+
+func newMultiwayBitmapOrTestLaneObserver(lanes int) *multiwayBitmapOrTestLaneObserver {
+	return &multiwayBitmapOrTestLaneObserver{
+		started:  make([]time.Time, lanes),
+		finished: make([]time.Time, lanes),
+	}
+}
+
+func (observer *multiwayBitmapOrTestLaneObserver) laneStarted(lane int) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if lane < 0 || lane >= len(observer.started) {
+		panic("unexpected multiway bitmap OR lane")
+	}
+	if !observer.started[lane].IsZero() {
+		panic("multiway bitmap OR lane started twice")
+	}
+	observer.started[lane] = time.Now()
+}
+
+func (observer *multiwayBitmapOrTestLaneObserver) laneFinished(lane int) {
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if lane < 0 || lane >= len(observer.finished) {
+		panic("unexpected multiway bitmap OR lane")
+	}
+	if observer.started[lane].IsZero() {
+		panic("multiway bitmap OR lane finished before it started")
+	}
+	if !observer.finished[lane].IsZero() {
+		panic("multiway bitmap OR lane finished twice")
+	}
+	observer.finished[lane] = time.Now()
+}
+
+func (observer *multiwayBitmapOrTestLaneObserver) assertComplete(t *testing.T) {
+	t.Helper()
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	for lane, started := range observer.started {
+		if started.IsZero() {
+			t.Errorf("lane %d did not start", lane)
+		}
+		if observer.finished[lane].IsZero() {
+			t.Errorf("lane %d did not finish", lane)
+		}
+		if observer.finished[lane].Before(started) {
+			t.Errorf("lane %d finished before it started", lane)
+		}
+	}
+}
+
+func TestParOrMultiwayBitmapOrExecutionLaneContract(t *testing.T) {
 	previousProcs := runtime.GOMAXPROCS(multiwayBitmapOrMaxWorkers)
 	previousDefault := defaultWorkerCount
 	defaultWorkerCount = multiwayBitmapOrMaxWorkers
@@ -404,6 +463,7 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 		parallelism int
 		want        int
 	}{
+		{parallelism: 1, want: 1},
 		{parallelism: 2, want: 2},
 		{parallelism: 3, want: 3},
 		{parallelism: 4, want: 4},
@@ -421,13 +481,15 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 			t.Fatalf("validate ParOr(%d) result: %v", test.parallelism, err)
 		}
 
-		parallelism := test.parallelism
-		if parallelism == 0 {
-			parallelism = defaultWorkerCount
+		observer := newMultiwayBitmapOrTestLaneObserver(test.want)
+		observed, accepted := multiwayBitmapOrWithObserver(test.parallelism, inputs, observer)
+		if !accepted {
+			t.Fatalf("ParOr(%d) did not take the accepted reducer", test.parallelism)
 		}
-		if workers := multiwayBitmapOrWorkerCount(parallelism); workers != test.want {
-			t.Errorf("ParOr(%d) selected %d workers, want %d", test.parallelism, workers, test.want)
+		if !observed.Equals(expected) {
+			t.Fatalf("observed ParOr(%d) result differs from expected bitmap", test.parallelism)
 		}
+		observer.assertComplete(t)
 	}
 	for i, input := range inputs {
 		if !input.Equals(inputSnapshots[i]) {
@@ -435,6 +497,53 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 		}
 		if err := input.Validate(); err != nil {
 			t.Fatalf("validate input %d after ParOr: %v", i, err)
+		}
+	}
+}
+
+func TestParOrMultiwayBitmapOrBoundedConcurrentRequests(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(multiwayBitmapOrMaxWorkers)
+	previousDefault := defaultWorkerCount
+	defaultWorkerCount = multiwayBitmapOrMaxWorkers
+	t.Cleanup(func() {
+		defaultWorkerCount = previousDefault
+		runtime.GOMAXPROCS(previousProcs)
+	})
+
+	inputs, expected := newMultiwayBitmapOrContractInputs(t)
+	inputSnapshots := make([]*Bitmap, len(inputs))
+	for i, input := range inputs {
+		inputSnapshots[i] = input.Clone()
+	}
+
+	requests := []int{0, bitmapContainerSize, 0, bitmapContainerSize, 0, bitmapContainerSize, 0, bitmapContainerSize}
+	start := make(chan struct{})
+	results := make(chan *Bitmap, len(requests))
+	for _, parallelism := range requests {
+		// ParOr filters its variadic slice in place, so concurrent calls need
+		// independent slice headers while sharing the same immutable bitmaps.
+		callInputs := append([]*Bitmap(nil), inputs...)
+		go func(parallelism int, callInputs []*Bitmap) {
+			<-start
+			results <- ParOr(parallelism, callInputs...)
+		}(parallelism, callInputs)
+	}
+	close(start)
+	for range requests {
+		got := <-results
+		if !got.Equals(expected) {
+			t.Fatal("concurrent high-request ParOr result differs from expected bitmap")
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("validate concurrent high-request ParOr result: %v", err)
+		}
+	}
+	for i, input := range inputs {
+		if !input.Equals(inputSnapshots[i]) {
+			t.Fatalf("concurrent ParOr modified input %d", i)
+		}
+		if err := input.Validate(); err != nil {
+			t.Fatalf("validate input %d after concurrent ParOr: %v", i, err)
 		}
 	}
 }

@@ -2,9 +2,11 @@ package roaring
 
 import (
 	"container/heap"
+	"context"
 	"fmt"
 	"math/bits"
 	"runtime"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 )
@@ -149,6 +151,11 @@ const (
 	multiwayBitmapOrMaxWorkers = 4
 )
 
+type multiwayBitmapOrObserver interface {
+	laneStarted(lane int)
+	laneFinished(lane int)
+}
+
 type multiwayBitmapOrTask struct {
 	state      *multiwayBitmapOrState
 	result     *bitmapContainer
@@ -189,7 +196,7 @@ func reduceMultiwayBitmapOr(bitmaps []*Bitmap, result *bitmapContainer) {
 	result.cardinality = int(popcntSlice(result.bitmap))
 }
 
-func reduceMultiwayBitmapOrWords(inputs *[multiwayBitmapOrInputCount]*bitmapContainer, result *bitmapContainer, cardinality *atomic.Int64, start, end int, done *sync.WaitGroup) {
+func reduceMultiwayBitmapOrWords(inputs *[multiwayBitmapOrInputCount]*bitmapContainer, result *bitmapContainer, cardinality *atomic.Int64, start, end int) {
 	for _, input := range inputs {
 		for word := start; word < end; word++ {
 			result.bitmap[word] |= input.bitmap[word]
@@ -201,23 +208,47 @@ func reduceMultiwayBitmapOrWords(inputs *[multiwayBitmapOrInputCount]*bitmapCont
 		localCardinality += bits.OnesCount64(value)
 	}
 	cardinality.Add(int64(localCardinality))
-	if done != nil {
-		done.Done()
-	}
 }
 
 func (task *multiwayBitmapOrTask) reduce() {
-	reduceMultiwayBitmapOrWords(&task.state.inputs, task.result, &task.state.cardinality, task.start, task.end, &task.state.workers)
+	if trace.IsEnabled() {
+		task.reduceTraced()
+	} else {
+		task.reduceUntraced()
+	}
+	task.state.workers.Done()
 }
 
-// multiwayBitmapOrWorkerCount counts the caller's stripe as a worker and
-// bounds a request by available Ps and the specialization's four-worker limit.
+func (task *multiwayBitmapOrTask) reduceUntraced() {
+	reduceMultiwayBitmapOrWords(&task.state.inputs, task.result, &task.state.cardinality, task.start, task.end)
+}
+
+func (task *multiwayBitmapOrTask) reduceTraced() {
+	trace.WithRegion(context.Background(), "ParOr stripe worker", task.reduceUntraced)
+}
+
+func reduceMultiwayBitmapOrCaller(inputs *[multiwayBitmapOrInputCount]*bitmapContainer, result *bitmapContainer, cardinality *atomic.Int64, end int) {
+	if trace.IsEnabled() {
+		reduceMultiwayBitmapOrCallerTraced(inputs, result, cardinality, end)
+		return
+	}
+	reduceMultiwayBitmapOrWords(inputs, result, cardinality, 0, end)
+}
+
+func reduceMultiwayBitmapOrCallerTraced(inputs *[multiwayBitmapOrInputCount]*bitmapContainer, result *bitmapContainer, cardinality *atomic.Int64, end int) {
+	trace.WithRegion(context.Background(), "ParOr stripe caller", func() {
+		reduceMultiwayBitmapOrWords(inputs, result, cardinality, 0, end)
+	})
+}
+
+// multiwayBitmapOrWorkerCount counts the caller's stripe as an execution
+// lane and bounds a request by available Ps and the specialization's four-lane limit.
 func multiwayBitmapOrWorkerCount(parallelism int) int {
 	return minOfInt(parallelism, minOfInt(multiwayBitmapOrMaxWorkers, runtime.GOMAXPROCS(0)))
 }
 
-// reduceMultiwayBitmapOrParallel gives each worker exclusive output words and
-// combines only the workers' local cardinalities.
+// reduceMultiwayBitmapOrParallel gives each execution lane exclusive output
+// words and combines only the lanes' local cardinalities.
 func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *bitmapContainer) {
 	workerCount := multiwayBitmapOrWorkerCount(parallelism)
 	if workerCount == 1 {
@@ -241,8 +272,57 @@ func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *
 		task.end = minOfInt(task.start+wordsPerWorker, bitmapContainerSize)
 		go task.run()
 	}
-	reduceMultiwayBitmapOrWords(&state.inputs, result, &state.cardinality, 0, wordsPerWorker, nil)
+	reduceMultiwayBitmapOrCaller(&state.inputs, result, &state.cardinality, wordsPerWorker)
 	state.workers.Wait()
+	result.cardinality = int(state.cardinality.Load())
+	state.cardinality.Store(0)
+	clear(state.inputs[:])
+	for i := range state.tasks {
+		state.tasks[i].result = nil
+	}
+	multiwayBitmapOrStatePool.Put(state)
+}
+
+// reduceMultiwayBitmapOrParallelObserved is the candidate-owned execution
+// seam used to verify public-call lane mapping without changing the normal
+// reducer's task descriptors or allocation behavior.
+func reduceMultiwayBitmapOrParallelObserved(parallelism int, bitmaps []*Bitmap, result *bitmapContainer, observer multiwayBitmapOrObserver) {
+	workerCount := multiwayBitmapOrWorkerCount(parallelism)
+	if workerCount == 1 {
+		observer.laneStarted(0)
+		reduceMultiwayBitmapOr(bitmaps, result)
+		observer.laneFinished(0)
+		return
+	}
+
+	state := multiwayBitmapOrStatePool.Get().(*multiwayBitmapOrState)
+	state.setTaskCount(workerCount)
+	for i, bitmap := range bitmaps {
+		state.inputs[i] = bitmap.highlowcontainer.containers[0].(*bitmapContainer)
+	}
+
+	wordsPerWorker := (bitmapContainerSize + workerCount - 1) / workerCount
+	state.workers.Add(workerCount - 1)
+	var observedWorkers sync.WaitGroup
+	for worker := 1; worker < workerCount; worker++ {
+		task := &state.tasks[worker-1]
+		task.state = state
+		task.result = result
+		task.start = worker * wordsPerWorker
+		task.end = minOfInt(task.start+wordsPerWorker, bitmapContainerSize)
+		observedWorkers.Add(1)
+		go func(task *multiwayBitmapOrTask, lane int) {
+			observer.laneStarted(lane)
+			task.run()
+			observer.laneFinished(lane)
+			observedWorkers.Done()
+		}(task, worker)
+	}
+	observer.laneStarted(0)
+	reduceMultiwayBitmapOrCaller(&state.inputs, result, &state.cardinality, wordsPerWorker)
+	observer.laneFinished(0)
+	state.workers.Wait()
+	observedWorkers.Wait()
 	result.cardinality = int(state.cardinality.Load())
 	state.cardinality.Store(0)
 	clear(state.inputs[:])
@@ -285,6 +365,22 @@ func multiwayBitmapOr(parallelism int, bitmaps []*Bitmap) (*Bitmap, bool) {
 		containers:      []container{output},
 		needCopyOnWrite: make([]bool, 1),
 	}}, true
+}
+
+// multiwayBitmapOrWithObserver replays an accepted reduction with
+// candidate-owned span instrumentation for the execution-lane contract test.
+func multiwayBitmapOrWithObserver(parallelism int, bitmaps []*Bitmap, observer multiwayBitmapOrObserver) (*Bitmap, bool) {
+	result, accepted := multiwayBitmapOr(parallelism, bitmaps)
+	if !accepted || observer == nil {
+		return result, accepted
+	}
+
+	observedResult := newBitmapContainer()
+	if parallelism == 0 {
+		parallelism = defaultWorkerCount
+	}
+	reduceMultiwayBitmapOrParallelObserved(parallelism, bitmaps, observedResult, observer)
+	return result, true
 }
 
 func appenderRoutine(bitmapChan chan<- *Bitmap, resultChan <-chan keyedContainer, expectedKeysChan <-chan int) {
@@ -480,8 +576,10 @@ func ParAnd(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 
 // ParOr computes the union (OR) of all provided bitmaps in parallel,
 // where the parameter "parallelism" caps how many workers are used
-// (if it is set to 0, a default number of workers is chosen). The exact
-// 512-input one-key bitmap specialization uses at most four workers.
+// (if it is set to 0, a default number of workers is chosen). For the exact
+// 512-input one-key bitmap specialization, parallelism is a caller-inclusive
+// execution-lane count capped at four: the caller owns lane zero and the
+// remaining lanes run in launched stripe workers.
 func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	var lKey uint16 = MaxUint16
 	var hKey uint16
