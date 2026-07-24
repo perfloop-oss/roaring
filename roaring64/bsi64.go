@@ -206,6 +206,37 @@ func (b *BSI) GetBigValue(columnID uint64) (value *big.Int, exists bool) {
 	return val, exists
 }
 
+func (b *BSI) getBigValueNoExistsCheck(columnID uint64) *big.Int {
+	val := big.NewInt(0)
+	for i := b.BitCount(); i >= 0; i-- {
+		if b.bA[i].Contains(columnID) {
+			bigBit := big.NewInt(1)
+			bigBit.Lsh(bigBit, uint(i))
+			val.Or(val, bigBit)
+		}
+	}
+
+	if b.IsNegative(columnID) {
+		val = negativeTwosComplementToInt(val)
+	}
+	return val
+}
+
+func (b *BSI) getValueNoExistsCheck(columnID uint64) int64 {
+	bv := b.getBigValueNoExistsCheck(columnID)
+	if !bv.IsInt64() {
+		if bv.Sign() == -1 {
+			msg := fmt.Errorf("can't represent a negative %d bit value as an int64", b.BitCount())
+			panic(msg)
+		}
+		if bv.Sign() == 1 {
+			msg := fmt.Errorf("can't represent a positive %d bit value as an int64", b.BitCount())
+			panic(msg)
+		}
+	}
+	return bv.Int64()
+}
+
 func negativeTwosComplementToInt(val *big.Int) *big.Int {
 	inverted := new(big.Int).Not(val)
 	mask := new(big.Int).Lsh(big.NewInt(1), uint(val.BitLen()))
@@ -754,6 +785,8 @@ func (b *BSI) Transpose() *Bitmap {
 func (b *BSI) IntersectAndTranspose(parallelism int, foundSet *Bitmap) *Bitmap {
 	if foundSet == nil {
 		foundSet = &b.eBM
+	} else {
+		foundSet = And(foundSet, &b.eBM)
 	}
 	trans := &task{bsi: b}
 	return parallelExecutor(parallelism, trans, transpose, foundSet)
@@ -768,9 +801,8 @@ func transpose(e *task, batch []uint64, resultsChan chan *Bitmap, wg *sync.WaitG
 		results.RunOptimize()
 	}
 	for _, cID := range batch {
-		if value, ok := e.bsi.GetValue(cID); ok {
-			results.Add(uint64(value))
-		}
+		value := e.bsi.getValueNoExistsCheck(cID)
+		results.Add(uint64(value))
 	}
 	resultsChan <- results
 }
@@ -1001,10 +1033,9 @@ func batchEqual(e *task, batch []uint64, resultsChan chan *Bitmap,
 
 	for i := 0; i < len(batch); i++ {
 		cID := batch[i]
-		if value, ok := e.bsi.GetBigValue(cID); ok {
-			if _, yes := e.values[string(value.Bytes())]; yes {
-				results.Add(cID)
-			}
+		value := e.bsi.getBigValueNoExistsCheck(cID)
+		if _, yes := e.values[string(value.Bytes())]; yes {
+			results.Add(cID)
 		}
 	}
 	resultsChan <- results
@@ -1114,6 +1145,8 @@ func (b *BSI) addDigit(foundSet *Bitmap, i int) {
 func (b *BSI) TransposeWithCounts(parallelism int, foundSet, filterSet *Bitmap) *BSI {
 	if foundSet == nil {
 		foundSet = &b.eBM
+	} else {
+		foundSet = And(foundSet, &b.eBM)
 	}
 	if filterSet == nil {
 		filterSet = &b.eBM
@@ -1130,16 +1163,15 @@ func transposeWithCounts(input *BSI, filterSet *Bitmap, batch []uint64, resultsC
 		results.RunOptimize()
 	}
 	for _, cID := range batch {
-		if value, ok := input.GetValue(cID); ok {
-			if !filterSet.Contains(uint64(value)) {
-				continue
-			}
-			if val, ok2 := results.GetValue(uint64(value)); !ok2 {
-				results.SetValue(uint64(value), 1)
-			} else {
-				val++
-				results.SetValue(uint64(value), val)
-			}
+		value := input.getValueNoExistsCheck(cID)
+		if !filterSet.Contains(uint64(value)) {
+			continue
+		}
+		if val, ok2 := results.GetValue(uint64(value)); !ok2 {
+			results.SetValue(uint64(value), 1)
+		} else {
+			val++
+			results.SetValue(uint64(value), val)
 		}
 	}
 	resultsChan <- results

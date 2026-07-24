@@ -152,6 +152,16 @@ func (b *BSI) GetValue(columnID uint64) (int64, bool) {
 	return value, exists
 }
 
+func (b *BSI) getValueNoExistsCheck(columnID uint64) int64 {
+	value := int64(0)
+	for i := 0; i < b.BitCount(); i++ {
+		if b.bA[i].Contains(uint32(columnID)) {
+			value |= (1 << uint64(i))
+		}
+	}
+	return value
+}
+
 type action func(t *task, batch []uint32, resultsChan chan *roaring.Bitmap, wg *sync.WaitGroup)
 
 func parallelExecutor(parallelism int, t *task, e action,
@@ -600,6 +610,8 @@ func (b *BSI) Transpose() *roaring.Bitmap {
 func (b *BSI) IntersectAndTranspose(parallelism int, foundSet *roaring.Bitmap) *roaring.Bitmap {
 	if foundSet == nil {
 		foundSet = b.eBM
+	} else {
+		foundSet = roaring.And(foundSet, b.eBM)
 	}
 	trans := &task{bsi: b}
 	return parallelExecutor(parallelism, trans, transpose, foundSet)
@@ -614,9 +626,8 @@ func transpose(e *task, batch []uint32, resultsChan chan *roaring.Bitmap, wg *sy
 		results.RunOptimize()
 	}
 	for _, cID := range batch {
-		if value, ok := e.bsi.GetValue(uint64(cID)); ok {
-			results.Add(uint32(value))
-		}
+		value := e.bsi.getValueNoExistsCheck(uint64(cID))
+		results.Add(uint32(value))
 	}
 	resultsChan <- results
 }
@@ -870,10 +881,9 @@ func (b *BSI) parallelBatchEqualScan(parallelism int, vals []uint64) *roaring.Bi
 			defer wg.Done()
 			out := roaring.NewBitmap()
 			for _, col := range cols {
-				if v, ok := b.GetValue(uint64(col)); ok {
-					if _, hit := want[uint64(v)]; hit {
-						out.Add(col)
-					}
+				v := b.getValueNoExistsCheck(uint64(col))
+				if _, hit := want[uint64(v)]; hit {
+					out.Add(col)
 				}
 			}
 			resultsChan <- out
@@ -1022,6 +1032,8 @@ func (b *BSI) addDigit(foundSet *roaring.Bitmap, i int) {
 func (b *BSI) TransposeWithCounts(parallelism int, foundSet *roaring.Bitmap) *BSI {
 	if foundSet == nil {
 		foundSet = b.eBM
+	} else {
+		foundSet = roaring.And(foundSet, b.eBM)
 	}
 	return parallelExecutorBSIResults(parallelism, b, transposeWithCounts, foundSet, true)
 }
@@ -1035,13 +1047,12 @@ func transposeWithCounts(input *BSI, batch []uint32, resultsChan chan *BSI, wg *
 		results.RunOptimize()
 	}
 	for _, cID := range batch {
-		if value, ok := input.GetValue(uint64(cID)); ok {
-			if val, ok2 := results.GetValue(uint64(value)); !ok2 {
-				results.SetValue(uint64(value), 1)
-			} else {
-				val++
-				results.SetValue(uint64(value), val)
-			}
+		value := input.getValueNoExistsCheck(uint64(cID))
+		if val, ok2 := results.GetValue(uint64(value)); !ok2 {
+			results.SetValue(uint64(value), 1)
+		} else {
+			val++
+			results.SetValue(uint64(value), val)
 		}
 	}
 	resultsChan <- results
