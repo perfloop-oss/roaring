@@ -211,10 +211,9 @@ func (task *multiwayBitmapOrTask) reduce() {
 }
 
 // multiwayBitmapOrWorkerCount counts the caller's stripe as a worker and
-// bounds a request by available Ps, the output-word partition, and the
-// specialization's four-worker resource limit.
+// bounds a request by available Ps and the specialization's four-worker limit.
 func multiwayBitmapOrWorkerCount(parallelism int) int {
-	return minOfInt(parallelism, minOfInt(multiwayBitmapOrMaxWorkers, minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0))))
+	return minOfInt(parallelism, minOfInt(multiwayBitmapOrMaxWorkers, runtime.GOMAXPROCS(0)))
 }
 
 // reduceMultiwayBitmapOrParallel gives each worker exclusive output words and
@@ -248,7 +247,6 @@ func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *
 	state.cardinality.Store(0)
 	clear(state.inputs[:])
 	for i := range state.tasks {
-		state.tasks[i].state = nil
 		state.tasks[i].result = nil
 	}
 	multiwayBitmapOrStatePool.Put(state)
@@ -267,9 +265,6 @@ func multiwayBitmapOr(parallelism int, bitmaps []*Bitmap) (*Bitmap, bool) {
 
 	key := bitmaps[0].highlowcontainer.keys[0]
 	for _, bitmap := range bitmaps {
-		if bitmap.highlowcontainer.size() != 1 {
-			return nil, false
-		}
 		if _, ok := bitmap.highlowcontainer.containers[0].(*bitmapContainer); !ok {
 			return nil, false
 		}
