@@ -362,6 +362,30 @@ func TestParOrMultiwayBitmapOrFullUnion(t *testing.T) {
 	}
 }
 
+func newMultiwayBitmapOrContractInputs(t *testing.T) ([]*Bitmap, *Bitmap) {
+	t.Helper()
+
+	inputs := make([]*Bitmap, multiwayBitmapOrTestInputCount)
+	expected := NewBitmap()
+	for low := uint32(0); low < 1<<16; low += 2 {
+		expected.Add(low)
+	}
+	for input := range inputs {
+		bitmap := NewBitmap()
+		for low := uint32(input%4) * 2; low < 1<<16; low += 8 {
+			bitmap.Add(low)
+		}
+		if bitmap.highlowcontainer.size() != 1 {
+			t.Fatalf("input %d has %d containers, want 1", input, bitmap.highlowcontainer.size())
+		}
+		if _, ok := bitmap.highlowcontainer.containers[0].(*bitmapContainer); !ok {
+			t.Fatalf("input %d is not bitmap-backed", input)
+		}
+		inputs[input] = bitmap
+	}
+	return inputs, expected
+}
+
 func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 	previousProcs := runtime.GOMAXPROCS(multiwayBitmapOrMaxWorkers)
 	previousDefault := defaultWorkerCount
@@ -371,7 +395,11 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 		runtime.GOMAXPROCS(previousProcs)
 	})
 
-	inputs, expected := newParOrHighFanInBitmapInputs()
+	inputs, expected := newMultiwayBitmapOrContractInputs(t)
+	inputSnapshots := make([]*Bitmap, len(inputs))
+	for i, input := range inputs {
+		inputSnapshots[i] = input.Clone()
+	}
 	for _, test := range []struct {
 		parallelism int
 		want        int
@@ -383,7 +411,15 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 		{parallelism: bitmapContainerSize, want: 4},
 	} {
 		got := ParOr(test.parallelism, inputs...)
-		assertParOrResult(t, got, expected)
+		if !got.Equals(expected) {
+			t.Fatalf("ParOr(%d) result differs from expected bitmap", test.parallelism)
+		}
+		if got.GetCardinality() != expected.GetCardinality() {
+			t.Fatalf("ParOr(%d) cardinality %d, want %d", test.parallelism, got.GetCardinality(), expected.GetCardinality())
+		}
+		if err := got.Validate(); err != nil {
+			t.Fatalf("validate ParOr(%d) result: %v", test.parallelism, err)
+		}
 
 		parallelism := test.parallelism
 		if parallelism == 0 {
@@ -391,6 +427,14 @@ func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
 		}
 		if workers := multiwayBitmapOrWorkerCount(parallelism); workers != test.want {
 			t.Errorf("ParOr(%d) selected %d workers, want %d", test.parallelism, workers, test.want)
+		}
+	}
+	for i, input := range inputs {
+		if !input.Equals(inputSnapshots[i]) {
+			t.Fatalf("ParOr modified input %d", i)
+		}
+		if err := input.Validate(); err != nil {
+			t.Fatalf("validate input %d after ParOr: %v", i, err)
 		}
 	}
 }
