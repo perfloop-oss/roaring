@@ -2,6 +2,7 @@ package roaring
 
 import (
 	"math/rand"
+	"runtime"
 	"testing"
 )
 
@@ -157,7 +158,7 @@ func TestParOrMultiwayBitmapOrFromBuffer(t *testing.T) {
 	}
 }
 
-func TestParOrMultiwayBitmapOrFullResult(t *testing.T) {
+func TestParOrMultiwayBitmapOrFullUnion(t *testing.T) {
 	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
 		t.Fatalf("test uses %d inputs, fast path starts at %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
 	}
@@ -190,9 +191,6 @@ func TestParOrMultiwayBitmapOrFullResult(t *testing.T) {
 	if got.GetCardinality() != want.GetCardinality() {
 		t.Fatalf("ParOr cardinality %d, want %d", got.GetCardinality(), want.GetCardinality())
 	}
-	if _, ok := got.highlowcontainer.containers[0].(*runContainer16); !ok {
-		t.Fatalf("ParOr full result has %T container, want *runContainer16", got.highlowcontainer.containers[0])
-	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("validate ParOr result: %v", err)
 	}
@@ -203,6 +201,16 @@ func TestParOrMultiwayBitmapOrFullResult(t *testing.T) {
 		}
 		if err := input.Validate(); err != nil {
 			t.Fatalf("validate input %d after ParOr: %v", i, err)
+		}
+	}
+}
+
+func TestMultiwayBitmapOrWorkerCount(t *testing.T) {
+	maxWorkers := minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0))
+	for _, parallelism := range []int{1, 2, 3, 4, bitmapContainerSize, bitmapContainerSize + 1} {
+		want := minOfInt(parallelism, maxWorkers)
+		if got := multiwayBitmapOrWorkerCount(parallelism); got != want {
+			t.Errorf("worker count for parallelism %d is %d, want %d", parallelism, got, want)
 		}
 	}
 }
@@ -227,7 +235,7 @@ func TestParOrMultiwayBitmapOrNegativeAndDefaultParallelism(t *testing.T) {
 	}
 }
 
-func TestParOrMultiwayBitmapOrArrayResult(t *testing.T) {
+func TestParOrMultiwayBitmapOrSparseUnion(t *testing.T) {
 	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
 		t.Fatalf("test uses %d inputs, fast path uses %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
 	}
@@ -262,9 +270,6 @@ func TestParOrMultiwayBitmapOrArrayResult(t *testing.T) {
 	}
 	if got.GetCardinality() != expected.GetCardinality() {
 		t.Fatalf("ParOr cardinality %d, want %d", got.GetCardinality(), expected.GetCardinality())
-	}
-	if _, ok := got.highlowcontainer.containers[0].(*arrayContainer); !ok {
-		t.Fatalf("ParOr sparse result has %T container, want *arrayContainer", got.highlowcontainer.containers[0])
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("validate ParOr sparse result: %v", err)

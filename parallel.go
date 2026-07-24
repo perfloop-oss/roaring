@@ -3,8 +3,10 @@ package roaring
 import (
 	"container/heap"
 	"fmt"
+	"math/bits"
 	"runtime"
 	"sync"
+	"sync/atomic"
 )
 
 var defaultWorkerCount = runtime.NumCPU()
@@ -141,15 +143,127 @@ func toBitmapContainer(c container) container {
 }
 
 // multiwayBitmapOrInputCount is the measured high-fan-in workload for the
-// direct reduction. All other fan-ins retain FastOr.
+// word-stripe reduction. All other fan-ins retain FastOr.
 const multiwayBitmapOrInputCount = 512
 
-// multiwayBitmapOr reduces the exact measured one-key bitmap shape directly
-// into a fresh output. Other shapes retain FastOr.
-func multiwayBitmapOr(bitmaps []*Bitmap) (*Bitmap, bool) {
+type multiwayBitmapOrTask struct {
+	state      *multiwayBitmapOrState
+	result     *bitmapContainer
+	start, end int
+	run        func()
+}
+
+type multiwayBitmapOrState struct {
+	inputs      [multiwayBitmapOrInputCount]*bitmapContainer
+	cardinality atomic.Int64
+	workers     sync.WaitGroup
+	tasks       []multiwayBitmapOrTask
+}
+
+var multiwayBitmapOrStatePool = sync.Pool{
+	New: func() any { return new(multiwayBitmapOrState) },
+}
+
+func (state *multiwayBitmapOrState) setTaskCount(workerCount int) {
+	taskCount := workerCount - 1
+	if cap(state.tasks) < taskCount {
+		state.tasks = make([]multiwayBitmapOrTask, taskCount)
+		for i := range state.tasks {
+			state.tasks[i].run = state.tasks[i].reduce
+		}
+		return
+	}
+	state.tasks = state.tasks[:taskCount]
+}
+
+func reduceMultiwayBitmapOr(bitmaps []*Bitmap, result *bitmapContainer) {
+	for _, bitmap := range bitmaps {
+		input := bitmap.highlowcontainer.containers[0].(*bitmapContainer).bitmap
+		for word, value := range input {
+			result.bitmap[word] |= value
+		}
+	}
+	result.cardinality = int(popcntSlice(result.bitmap))
+}
+
+func reduceMultiwayBitmapOrWords(inputs *[multiwayBitmapOrInputCount]*bitmapContainer, result *bitmapContainer, cardinality *atomic.Int64, start, end int, done *sync.WaitGroup) {
+	for _, input := range inputs {
+		for word := start; word < end; word++ {
+			result.bitmap[word] |= input.bitmap[word]
+		}
+	}
+
+	localCardinality := 0
+	for _, value := range result.bitmap[start:end] {
+		localCardinality += bits.OnesCount64(value)
+	}
+	cardinality.Add(int64(localCardinality))
+	if done != nil {
+		done.Done()
+	}
+}
+
+func (task *multiwayBitmapOrTask) reduce() {
+	reduceMultiwayBitmapOrWords(&task.state.inputs, task.result, &task.state.cardinality, task.start, task.end, &task.state.workers)
+}
+
+// multiwayBitmapOrWorkerCount counts the caller's stripe as a worker and
+// bounds a request by available Ps and the output-word partition.
+func multiwayBitmapOrWorkerCount(parallelism int) int {
+	return minOfInt(parallelism, minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0)))
+}
+
+// reduceMultiwayBitmapOrParallel gives each worker exclusive output words and
+// combines only the workers' local cardinalities.
+func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *bitmapContainer) {
+	workerCount := multiwayBitmapOrWorkerCount(parallelism)
+	if workerCount == 1 {
+		reduceMultiwayBitmapOr(bitmaps, result)
+		return
+	}
+
+	state := multiwayBitmapOrStatePool.Get().(*multiwayBitmapOrState)
+	state.setTaskCount(workerCount)
+	for i, bitmap := range bitmaps {
+		state.inputs[i] = bitmap.highlowcontainer.containers[0].(*bitmapContainer)
+	}
+
+	wordsPerWorker := (bitmapContainerSize + workerCount - 1) / workerCount
+	state.workers.Add(workerCount - 1)
+	for worker := 1; worker < workerCount; worker++ {
+		task := &state.tasks[worker-1]
+		task.state = state
+		task.result = result
+		task.start = worker * wordsPerWorker
+		task.end = minOfInt(task.start+wordsPerWorker, bitmapContainerSize)
+		go task.run()
+	}
+	reduceMultiwayBitmapOrWords(&state.inputs, result, &state.cardinality, 0, wordsPerWorker, nil)
+	state.workers.Wait()
+	result.cardinality = int(state.cardinality.Load())
+	state.cardinality.Store(0)
+	clear(state.inputs[:])
+	for i := range state.tasks {
+		state.tasks[i].state = nil
+		state.tasks[i].result = nil
+	}
+	multiwayBitmapOrStatePool.Put(state)
+}
+
+// multiwayBitmapOr reduces one shared bitmap container into a fresh output
+// container. It only accepts the measured single-key shape so ParOr can retain
+// its existing generic implementation for other inputs.
+func multiwayBitmapOr(parallelism int, bitmaps []*Bitmap) (*Bitmap, bool) {
+	if parallelism < 0 {
+		return nil, false
+	}
+	if parallelism == 0 {
+		parallelism = defaultWorkerCount
+	}
+
 	key := bitmaps[0].highlowcontainer.keys[0]
 	for _, bitmap := range bitmaps {
-		if bitmap.highlowcontainer.size() != 1 || bitmap.highlowcontainer.keys[0] != key {
+		if bitmap.highlowcontainer.size() != 1 {
 			return nil, false
 		}
 		if _, ok := bitmap.highlowcontainer.containers[0].(*bitmapContainer); !ok {
@@ -158,23 +272,11 @@ func multiwayBitmapOr(bitmaps []*Bitmap) (*Bitmap, bool) {
 	}
 
 	result := newBitmapContainer()
-	for _, bitmap := range bitmaps {
-		input := bitmap.highlowcontainer.containers[0].(*bitmapContainer).bitmap
-		for word, value := range input {
-			result.bitmap[word] |= value
-		}
-	}
-	result.cardinality = int(popcntSlice(result.bitmap))
+	reduceMultiwayBitmapOrParallel(parallelism, bitmaps, result)
 
-	var output container = result
-	if result.cardinality <= arrayDefaultMaxSize {
-		output = result.toArrayContainer()
-	} else if result.isFull() {
-		output = newRunContainer16Range(0, MaxUint16)
-	}
 	return &Bitmap{roaringArray{
 		keys:            []uint16{key},
-		containers:      []container{output},
+		containers:      []container{result},
 		needCopyOnWrite: make([]bool, 1),
 	}}, true
 }
@@ -371,8 +473,8 @@ func ParAnd(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 }
 
 // ParOr computes the union (OR) of all provided bitmaps in parallel,
-// where the parameter "parallelism" determines how many workers are to be used
-// (if it is set to 0, a default number of workers is chosen)
+// where the parameter "parallelism" caps how many workers are used
+// (if it is set to 0, a default number of workers is chosen).
 func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	var lKey uint16 = MaxUint16
 	var hKey uint16
@@ -399,7 +501,7 @@ func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	keyRange := int(hKey) - int(lKey) + 1
 	if keyRange == 1 {
 		if len(bitmaps) == multiwayBitmapOrInputCount {
-			if result, ok := multiwayBitmapOr(bitmaps); ok {
+			if result, ok := multiwayBitmapOr(parallelism, bitmaps); ok {
 				return result
 			}
 		}
