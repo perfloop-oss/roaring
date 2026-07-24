@@ -207,23 +207,6 @@ func TestParOrMultiwayBitmapOrFullResult(t *testing.T) {
 	}
 }
 
-func TestMultiwayBitmapOrWorkerCount(t *testing.T) {
-	for _, test := range []struct {
-		parallelism int
-		want        int
-	}{
-		{parallelism: 1, want: 1},
-		{parallelism: 2, want: 2},
-		{parallelism: 3, want: 3},
-		{parallelism: 4, want: 4},
-		{parallelism: bitmapContainerSize + 1, want: bitmapContainerSize},
-	} {
-		if got := multiwayBitmapOrWorkerCount(test.parallelism); got != test.want {
-			t.Errorf("worker count for parallelism %d is %d, want %d", test.parallelism, got, test.want)
-		}
-	}
-}
-
 func TestParOrMultiwayBitmapOrNegativeAndDefaultParallelism(t *testing.T) {
 	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
 		t.Fatalf("test uses %d inputs, fast path uses %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
