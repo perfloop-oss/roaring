@@ -1,6 +1,7 @@
 package roaring
 
 import (
+	"encoding/binary"
 	"math/rand"
 	"runtime"
 	"testing"
@@ -77,6 +78,36 @@ func newSerializedOneKeyBitmaps(t *testing.T, key uint16) [][]byte {
 			t.Fatalf("serialize bitmap: %v", err)
 		}
 	}
+	return serialized
+}
+
+// sparseBitmapBackedSerializedInput returns a serialized bitmap whose header
+// declares a bitmap container while the retained bitmap words contain two bits.
+func sparseBitmapBackedSerializedInput(t *testing.T, key uint16) []byte {
+	t.Helper()
+
+	source := NewBitmap()
+	for i := 0; i <= arrayDefaultMaxSize; i++ {
+		source.Add(uint32(key)<<16 | uint32(i*15))
+	}
+	if _, ok := source.highlowcontainer.containers[0].(*bitmapContainer); !ok {
+		t.Fatal("source is not bitmap-backed")
+	}
+	serialized, err := source.ToBytes()
+	if err != nil {
+		t.Fatalf("serialize source: %v", err)
+	}
+
+	const bitmapOffset = 16 // no-run header, one key/card pair, and one offset
+	if len(serialized) != bitmapOffset+bitmapContainerSize*8 {
+		t.Fatalf("serialized bitmap is %d bytes, want %d", len(serialized), bitmapOffset+bitmapContainerSize*8)
+	}
+	// The portable format stores cardinality - 1 at bytes 10:12. Keep it above
+	// the array threshold so FromBuffer selects a bitmapContainer, then replace
+	// its retained word plane with a sparse one.
+	binary.LittleEndian.PutUint16(serialized[10:12], uint16(arrayDefaultMaxSize))
+	clear(serialized[bitmapOffset:])
+	serialized[bitmapOffset] = 0x03
 	return serialized
 }
 
@@ -158,6 +189,49 @@ func TestParOrMultiwayBitmapOrFromBuffer(t *testing.T) {
 	}
 }
 
+func TestParOrMultiwayBitmapOrSparseImportedHeader(t *testing.T) {
+	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
+		t.Fatalf("test uses %d inputs, fast path starts at %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
+	}
+
+	const key = uint16(8)
+	serialized := sparseBitmapBackedSerializedInput(t, key)
+	loadInputs := func() []*Bitmap {
+		inputs := make([]*Bitmap, multiwayBitmapOrTestInputCount)
+		for i := range inputs {
+			inputs[i] = NewBitmap()
+			if _, err := inputs[i].FromBuffer(append([]byte(nil), serialized...)); err != nil {
+				t.Fatalf("deserialize bitmap %d: %v", i, err)
+			}
+			if _, ok := inputs[i].highlowcontainer.containers[0].(*bitmapContainer); !ok {
+				t.Fatalf("bitmap %d is not bitmap-backed", i)
+			}
+		}
+		return inputs
+	}
+
+	want := FastOr(loadInputs()...)
+	got := ParOr(4, loadInputs()...)
+	if !got.Equals(want) {
+		t.Fatal("ParOr result differs from FastOr")
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("validate ParOr result: %v", err)
+	}
+	if err := want.Validate(); err != nil {
+		t.Fatalf("validate FastOr result: %v", err)
+	}
+	if _, ok := got.highlowcontainer.containers[0].(*arrayContainer); !ok {
+		t.Fatalf("ParOr sparse imported result has %T container, want *arrayContainer", got.highlowcontainer.containers[0])
+	}
+	if _, err := got.ToBytes(); err != nil {
+		t.Fatalf("serialize ParOr result: %v", err)
+	}
+	if _, err := want.ToBytes(); err != nil {
+		t.Fatalf("serialize FastOr result: %v", err)
+	}
+}
+
 func TestParOrMultiwayBitmapOrFullUnion(t *testing.T) {
 	if multiwayBitmapOrTestInputCount != multiwayBitmapOrInputCount {
 		t.Fatalf("test uses %d inputs, fast path starts at %d", multiwayBitmapOrTestInputCount, multiwayBitmapOrInputCount)
@@ -205,12 +279,35 @@ func TestParOrMultiwayBitmapOrFullUnion(t *testing.T) {
 	}
 }
 
-func TestMultiwayBitmapOrWorkerCount(t *testing.T) {
-	maxWorkers := minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0))
-	for _, parallelism := range []int{1, 2, 3, 4, bitmapContainerSize, bitmapContainerSize + 1} {
-		want := minOfInt(parallelism, maxWorkers)
-		if got := multiwayBitmapOrWorkerCount(parallelism); got != want {
-			t.Errorf("worker count for parallelism %d is %d, want %d", parallelism, got, want)
+func TestParOrMultiwayBitmapOrWorkerCountContract(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(multiwayBitmapOrMaxWorkers)
+	previousDefault := defaultWorkerCount
+	defaultWorkerCount = multiwayBitmapOrMaxWorkers
+	t.Cleanup(func() {
+		defaultWorkerCount = previousDefault
+		runtime.GOMAXPROCS(previousProcs)
+	})
+
+	inputs, expected := newParOrHighFanInBitmapInputs()
+	for _, test := range []struct {
+		parallelism int
+		want        int
+	}{
+		{parallelism: 2, want: 2},
+		{parallelism: 3, want: 3},
+		{parallelism: 4, want: 4},
+		{parallelism: 0, want: 4},
+		{parallelism: bitmapContainerSize, want: 4},
+	} {
+		got := ParOr(test.parallelism, inputs...)
+		assertParOrResult(t, got, expected)
+
+		parallelism := test.parallelism
+		if parallelism == 0 {
+			parallelism = defaultWorkerCount
+		}
+		if workers := multiwayBitmapOrWorkerCount(parallelism); workers != test.want {
+			t.Errorf("ParOr(%d) selected %d workers, want %d", test.parallelism, workers, test.want)
 		}
 	}
 }

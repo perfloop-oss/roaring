@@ -144,7 +144,10 @@ func toBitmapContainer(c container) container {
 
 // multiwayBitmapOrInputCount is the measured high-fan-in workload for the
 // word-stripe reduction. All other fan-ins retain FastOr.
-const multiwayBitmapOrInputCount = 512
+const (
+	multiwayBitmapOrInputCount = 512
+	multiwayBitmapOrMaxWorkers = 4
+)
 
 type multiwayBitmapOrTask struct {
 	state      *multiwayBitmapOrState
@@ -208,9 +211,10 @@ func (task *multiwayBitmapOrTask) reduce() {
 }
 
 // multiwayBitmapOrWorkerCount counts the caller's stripe as a worker and
-// bounds a request by available Ps and the output-word partition.
+// bounds a request by available Ps, the output-word partition, and the
+// specialization's four-worker resource limit.
 func multiwayBitmapOrWorkerCount(parallelism int) int {
-	return minOfInt(parallelism, minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0)))
+	return minOfInt(parallelism, minOfInt(multiwayBitmapOrMaxWorkers, minOfInt(bitmapContainerSize, runtime.GOMAXPROCS(0))))
 }
 
 // reduceMultiwayBitmapOrParallel gives each worker exclusive output words and
@@ -274,9 +278,13 @@ func multiwayBitmapOr(parallelism int, bitmaps []*Bitmap) (*Bitmap, bool) {
 	result := newBitmapContainer()
 	reduceMultiwayBitmapOrParallel(parallelism, bitmaps, result)
 
+	var output container = result
+	if result.cardinality <= arrayDefaultMaxSize {
+		output = result.toArrayContainer()
+	}
 	return &Bitmap{roaringArray{
 		keys:            []uint16{key},
-		containers:      []container{result},
+		containers:      []container{output},
 		needCopyOnWrite: make([]bool, 1),
 	}}, true
 }
@@ -474,7 +482,8 @@ func ParAnd(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 
 // ParOr computes the union (OR) of all provided bitmaps in parallel,
 // where the parameter "parallelism" caps how many workers are used
-// (if it is set to 0, a default number of workers is chosen).
+// (if it is set to 0, a default number of workers is chosen). The exact
+// 512-input one-key bitmap specialization uses at most four workers.
 func ParOr(parallelism int, bitmaps ...*Bitmap) *Bitmap {
 	var lKey uint16 = MaxUint16
 	var hKey uint16
