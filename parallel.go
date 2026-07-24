@@ -150,6 +150,7 @@ type multiwayBitmapOrTask struct {
 	state      *multiwayBitmapOrState
 	result     *bitmapContainer
 	start, end int
+	run        func()
 }
 
 type multiwayBitmapOrState struct {
@@ -173,6 +174,18 @@ var multiwayBitmapOrStatePool = sync.Pool{
 	New: func() any { return new(multiwayBitmapOrState) },
 }
 
+func (state *multiwayBitmapOrState) setTaskCount(workerCount int) {
+	taskCount := workerCount - 1
+	if cap(state.tasks) < taskCount {
+		state.tasks = make([]multiwayBitmapOrTask, taskCount)
+		for i := range state.tasks {
+			state.tasks[i].run = state.tasks[i].reduce
+		}
+		return
+	}
+	state.tasks = state.tasks[:taskCount]
+}
+
 func newMultiwayBitmapOrOutput(key uint16) *multiwayBitmapOrOutput {
 	output := new(multiwayBitmapOrOutput)
 	output.container.bitmap = make([]uint64, bitmapContainerSize)
@@ -187,15 +200,12 @@ func newMultiwayBitmapOrOutput(key uint16) *multiwayBitmapOrOutput {
 }
 
 func reduceMultiwayBitmapOr(bitmaps []*Bitmap, result *bitmapContainer) {
-	var accumulator [bitmapContainerSize]uint64
 	for _, bitmap := range bitmaps {
 		input := bitmap.highlowcontainer.containers[0].(*bitmapContainer).bitmap
 		for word, value := range input {
-			accumulator[word] |= value
+			result.bitmap[word] |= value
 		}
 	}
-
-	copy(result.bitmap, accumulator[:])
 	result.cardinality = int(popcntSlice(result.bitmap))
 }
 
@@ -216,7 +226,7 @@ func reduceMultiwayBitmapOrWords(inputs *[multiwayBitmapOrInputCount]*bitmapCont
 	}
 }
 
-func reduceMultiwayBitmapOrTask(task *multiwayBitmapOrTask) {
+func (task *multiwayBitmapOrTask) reduce() {
 	reduceMultiwayBitmapOrWords(&task.state.inputs, task.result, &task.state.cardinality, task.start, task.end, &task.state.workers)
 }
 
@@ -234,16 +244,12 @@ func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *
 	}
 
 	state := multiwayBitmapOrStatePool.Get().(*multiwayBitmapOrState)
+	state.setTaskCount(workerCount)
 	for i, bitmap := range bitmaps {
 		state.inputs[i] = bitmap.highlowcontainer.containers[0].(*bitmapContainer)
 	}
 
 	wordsPerWorker := (bitmapContainerSize + workerCount - 1) / workerCount
-	if cap(state.tasks) < workerCount-1 {
-		state.tasks = make([]multiwayBitmapOrTask, workerCount-1)
-	} else {
-		state.tasks = state.tasks[:workerCount-1]
-	}
 	state.workers.Add(workerCount - 1)
 	for worker := 1; worker < workerCount; worker++ {
 		task := &state.tasks[worker-1]
@@ -251,14 +257,17 @@ func reduceMultiwayBitmapOrParallel(parallelism int, bitmaps []*Bitmap, result *
 		task.result = result
 		task.start = worker * wordsPerWorker
 		task.end = minOfInt(task.start+wordsPerWorker, bitmapContainerSize)
-		go reduceMultiwayBitmapOrTask(task)
+		go task.run()
 	}
 	reduceMultiwayBitmapOrWords(&state.inputs, result, &state.cardinality, 0, wordsPerWorker, nil)
 	state.workers.Wait()
 	result.cardinality = int(state.cardinality.Load())
 	state.cardinality.Store(0)
 	clear(state.inputs[:])
-	clear(state.tasks)
+	for i := range state.tasks {
+		state.tasks[i].state = nil
+		state.tasks[i].result = nil
+	}
 	multiwayBitmapOrStatePool.Put(state)
 }
 
