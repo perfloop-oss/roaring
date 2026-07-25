@@ -549,3 +549,184 @@ func TestBatchEqualLargeQueryValues(t *testing.T) {
 		}
 	}
 }
+
+func setupSmallTestBSI32() *BSI {
+	bsi := NewBSI(100, -100)
+	for i := uint64(0); i < 500; i++ {
+		val := int64((i % 50)) - 25
+		bsi.SetValue(i, val)
+	}
+	return bsi
+}
+
+func assertBSIEquivalent32(t *testing.T, b1, b2 *BSI) {
+	t.Helper()
+	ebm1 := b1.GetExistenceBitmap()
+	ebm2 := b2.GetExistenceBitmap()
+	if !ebm1.Equals(ebm2) {
+		t.Fatalf("Existence bitmaps do not match: card1=%d, card2=%d", ebm1.GetCardinality(), ebm2.GetCardinality())
+	}
+	it := ebm1.Iterator()
+	for it.HasNext() {
+		col := it.Next()
+		v1, ok1 := b1.GetValue(uint64(col))
+		v2, ok2 := b2.GetValue(uint64(col))
+		if ok1 != ok2 || v1 != v2 {
+			t.Fatalf("Value mismatch at column %d: v1=(%d, %v), v2=(%d, %v)", col, v1, ok1, v2, ok2)
+		}
+	}
+}
+
+func refTranspose32(b *BSI, foundSet *roaring.Bitmap) *roaring.Bitmap {
+	if foundSet == nil {
+		foundSet = b.GetExistenceBitmap()
+	} else {
+		foundSet = roaring.And(foundSet, b.GetExistenceBitmap())
+	}
+	results := roaring.NewBitmap()
+	it := foundSet.Iterator()
+	for it.HasNext() {
+		col := it.Next()
+		if val, ok := b.GetValue(uint64(col)); ok {
+			results.Add(uint32(val))
+		}
+	}
+	return results
+}
+
+func refTransposeWithCounts32(b *BSI, foundSet *roaring.Bitmap) *BSI {
+	if foundSet == nil {
+		foundSet = b.GetExistenceBitmap()
+	} else {
+		foundSet = roaring.And(foundSet, b.GetExistenceBitmap())
+	}
+	results := NewDefaultBSI()
+	it := foundSet.Iterator()
+	for it.HasNext() {
+		col := it.Next()
+		if val, ok := b.GetValue(uint64(col)); ok {
+			if count, ok2 := results.GetValue(uint64(val)); !ok2 {
+				results.SetValue(uint64(val), 1)
+			} else {
+				results.SetValue(uint64(val), count+1)
+			}
+		}
+	}
+	return results
+}
+
+func TestDifferentialCorrectness32(t *testing.T) {
+	// 1. Run full differential suite on a generated small BSI
+	t.Run("small_bsi_suite", func(t *testing.T) {
+		bsi := setupSmallTestBSI32()
+		ebm := bsi.GetExistenceBitmap()
+
+		// Subset
+		subset := roaring.NewBitmap()
+		it := ebm.Iterator()
+		for i := 0; it.HasNext() && i < 100; i++ {
+			subset.Add(it.Next())
+		}
+
+		// Superset (containing non-existent columns)
+		superset := ebm.Clone()
+		superset.Add(999990)
+		superset.Add(999991)
+
+		// Disjoint
+		disjoint := roaring.NewBitmap()
+		disjoint.Add(888880)
+		disjoint.Add(888881)
+
+		testCases := []struct {
+			name     string
+			foundSet *roaring.Bitmap
+		}{
+			{"nil", nil},
+			{"ebm", ebm},
+			{"subset", subset},
+			{"superset", superset},
+			{"disjoint", disjoint},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				var actual *roaring.Bitmap
+				if tc.foundSet == nil {
+					actual = bsi.Transpose()
+				} else {
+					actual = bsi.IntersectAndTranspose(0, tc.foundSet)
+				}
+				expected := refTranspose32(bsi, tc.foundSet)
+				if !actual.Equals(expected) {
+					t.Errorf("Transpose mismatch: expected card %d, got %d", expected.GetCardinality(), actual.GetCardinality())
+				}
+
+				actualCounts := bsi.TransposeWithCounts(0, tc.foundSet)
+				expectedCounts := refTransposeWithCounts32(bsi, tc.foundSet)
+				assertBSIEquivalent32(t, expectedCounts, actualCounts)
+			})
+		}
+	})
+
+	// 2. Load the checked-in large fixture and perform differential tests on a subset
+	t.Run("large_fixture_subset", func(t *testing.T) {
+		bsi := setupLargeBSI(t)
+		if bsi == nil {
+			t.Skip("skipping, large BSI setup failed")
+			return
+		}
+
+		ebm := bsi.GetExistenceBitmap()
+
+		// Create a small subset of the fixture to keep the tests very fast
+		subset := roaring.NewBitmap()
+		it := ebm.Iterator()
+		for i := 0; it.HasNext() && i < 200; i++ {
+			subset.Add(it.Next())
+		}
+
+		// Test IntersectAndTranspose
+		actual := bsi.IntersectAndTranspose(0, subset)
+		expected := refTranspose32(bsi, subset)
+		if !actual.Equals(expected) {
+			t.Errorf("Fixture subset Transpose mismatch: expected card %d, got %d", expected.GetCardinality(), actual.GetCardinality())
+		}
+
+		// Test TransposeWithCounts
+		actualCounts := bsi.TransposeWithCounts(0, subset)
+		expectedCounts := refTransposeWithCounts32(bsi, subset)
+		assertBSIEquivalent32(t, expectedCounts, actualCounts)
+	})
+
+	// 3. Test manually injected divergent state (divergent/dirty inputs)
+	t.Run("divergent_state", func(t *testing.T) {
+		dirtyBSI := setupSmallTestBSI32()
+		// Manually inject column 777770 into bitplane 0, but NOT into eBM
+		dirtyBSI.bA[0].Add(777770)
+
+		// Assert that the authoritative eBM does not contain it
+		if dirtyBSI.GetExistenceBitmap().Contains(777770) {
+			t.Fatal("eBM unexpectedly contains the manually injected column")
+		}
+
+		// Try with different foundSets
+		divergentFoundSet := roaring.NewBitmap()
+		divergentFoundSet.Add(777770) // only contains the dirty column
+
+		// Since 777770 is not in eBM, it must be filtered out during intersection.
+		act := dirtyBSI.IntersectAndTranspose(0, divergentFoundSet)
+		exp := refTranspose32(dirtyBSI, divergentFoundSet)
+		if !act.Equals(exp) {
+			t.Errorf("Divergent Transpose mismatch: expected %v, got %v", exp.ToArray(), act.ToArray())
+		}
+		if !act.IsEmpty() {
+			t.Errorf("Expected empty result for divergent column, got card %d", act.GetCardinality())
+		}
+
+		// TransposeWithCounts with divergentFoundSet should be empty
+		actC := dirtyBSI.TransposeWithCounts(0, divergentFoundSet)
+		expC := refTransposeWithCounts32(dirtyBSI, divergentFoundSet)
+		assertBSIEquivalent32(t, expC, actC)
+	})
+}

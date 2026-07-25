@@ -785,7 +785,7 @@ func (b *BSI) Transpose() *Bitmap {
 func (b *BSI) IntersectAndTranspose(parallelism int, foundSet *Bitmap) *Bitmap {
 	if foundSet == nil {
 		foundSet = &b.eBM
-	} else {
+	} else if foundSet != &b.eBM {
 		foundSet = And(foundSet, &b.eBM)
 	}
 	trans := &task{bsi: b}
@@ -1145,7 +1145,7 @@ func (b *BSI) addDigit(foundSet *Bitmap, i int) {
 func (b *BSI) TransposeWithCounts(parallelism int, foundSet, filterSet *Bitmap) *BSI {
 	if foundSet == nil {
 		foundSet = &b.eBM
-	} else {
+	} else if foundSet != &b.eBM {
 		foundSet = And(foundSet, &b.eBM)
 	}
 	if filterSet == nil {

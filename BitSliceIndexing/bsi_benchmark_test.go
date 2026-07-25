@@ -221,6 +221,7 @@ func benchmarkBatchEqualM(b *testing.B, m int, stride int64) {
 	bsi := setupLargeBSI(b)
 	if bsi == nil {
 		b.Skip("skipping, large BSI setup failed")
+		return
 	}
 	vals := make([]int64, m)
 	for i := range vals {

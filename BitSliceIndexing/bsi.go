@@ -610,7 +610,7 @@ func (b *BSI) Transpose() *roaring.Bitmap {
 func (b *BSI) IntersectAndTranspose(parallelism int, foundSet *roaring.Bitmap) *roaring.Bitmap {
 	if foundSet == nil {
 		foundSet = b.eBM
-	} else {
+	} else if foundSet != b.eBM {
 		foundSet = roaring.And(foundSet, b.eBM)
 	}
 	trans := &task{bsi: b}
@@ -1032,7 +1032,7 @@ func (b *BSI) addDigit(foundSet *roaring.Bitmap, i int) {
 func (b *BSI) TransposeWithCounts(parallelism int, foundSet *roaring.Bitmap) *BSI {
 	if foundSet == nil {
 		foundSet = b.eBM
-	} else {
+	} else if foundSet != b.eBM {
 		foundSet = roaring.And(foundSet, b.eBM)
 	}
 	return parallelExecutorBSIResults(parallelism, b, transposeWithCounts, foundSet, true)
