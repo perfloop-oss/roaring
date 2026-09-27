@@ -489,8 +489,15 @@ func (ra *roaringArray) serializedSizeInBytes() uint64 {
 	return answer
 }
 
+// serializeViaCopy selects the portable serializer, which writes each header
+// field through a small scratch buffer instead of building one preamble slice.
+var serializeViaCopy bool
+
 // spec: https://github.com/RoaringBitmap/RoaringFormatSpec
 func (ra *roaringArray) writeTo(w io.Writer) (n int64, err error) {
+	if serializeViaCopy {
+		return ra.writeToPortable(w)
+	}
 	hasRun := ra.hasRunCompression()
 	isRunSizeInBytes := 0
 	cookieSize := 8
@@ -556,6 +563,81 @@ func (ra *roaringArray) writeTo(w io.Writer) (n int64, err error) {
 	}
 	n += int64(written)
 
+	for _, c := range ra.containers {
+		written, err := c.writeTo(w)
+		if err != nil {
+			return n, err
+		}
+		n += int64(written)
+	}
+	return n, nil
+}
+
+// writeToPortable writes the same format as writeTo, one header field at a
+// time.
+func (ra *roaringArray) writeToPortable(w io.Writer) (n int64, err error) {
+	var scratch [4]byte
+	put := func(b []byte) error {
+		written, err := w.Write(b)
+		n += int64(written)
+		return err
+	}
+	hasRun := ra.hasRunCompression()
+	isRunSizeInBytes := 0
+	cookieSize := 8
+	if hasRun {
+		cookieSize = 4
+		isRunSizeInBytes = (len(ra.keys) + 7) / 8
+		binary.LittleEndian.PutUint16(scratch[0:], uint16(serialCookie))
+		binary.LittleEndian.PutUint16(scratch[2:], uint16(len(ra.keys)-1))
+		if err := put(scratch[:4]); err != nil {
+			return n, err
+		}
+		for i := 0; i < isRunSizeInBytes; i++ {
+			var bits byte
+			for j := 0; j < 8 && 8*i+j < len(ra.containers); j++ {
+				if _, ok := ra.containers[8*i+j].(*runContainer16); ok {
+					bits |= 1 << uint(j)
+				}
+			}
+			scratch[0] = bits
+			if err := put(scratch[:1]); err != nil {
+				return n, err
+			}
+		}
+	} else {
+		binary.LittleEndian.PutUint32(scratch[0:], uint32(serialCookieNoRunContainer))
+		if err := put(scratch[:4]); err != nil {
+			return n, err
+		}
+		binary.LittleEndian.PutUint32(scratch[0:], uint32(len(ra.keys)))
+		if err := put(scratch[:4]); err != nil {
+			return n, err
+		}
+	}
+	for i, key := range ra.keys {
+		binary.LittleEndian.PutUint16(scratch[0:], key)
+		binary.LittleEndian.PutUint16(scratch[2:], uint16(ra.containers[i].getCardinality()-1))
+		if err := put(scratch[:4]); err != nil {
+			return n, err
+		}
+	}
+	preambleSize := cookieSize + isRunSizeInBytes + 4*len(ra.keys)
+	startOffset := int64(preambleSize + 4*len(ra.keys))
+	if !hasRun || (len(ra.keys) >= noOffsetThreshold) {
+		for _, c := range ra.containers {
+			binary.LittleEndian.PutUint32(scratch[0:], uint32(startOffset))
+			if err := put(scratch[:4]); err != nil {
+				return n, err
+			}
+			switch rc := c.(type) {
+			case *runContainer16:
+				startOffset += 2 + int64(len(rc.iv))*4
+			default:
+				startOffset += int64(getSizeInBytesFromCardinality(c.getCardinality()))
+			}
+		}
+	}
 	for _, c := range ra.containers {
 		written, err := c.writeTo(w)
 		if err != nil {
